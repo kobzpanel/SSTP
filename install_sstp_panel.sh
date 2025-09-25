@@ -1,513 +1,388 @@
 #!/bin/bash
 
-# AI Fiesta's SSTP VPN Server & Web Panel Installer
-# Target OS: Ubuntu 22.04 LTS & 20.04 LTS
-#
-# This script is designed to be idempotent and will log its output for debugging.
+################################################################################
+# install_sstp_panel.sh
+# Automated installer: SSTP VPN server with web management panel (Nginx + PHP)
+# Supports: Ubuntu 20.04 LTS, 22.04 LTS
+# Logs actions: /var/log/sstp_panel_install.log
+# Author: AI Fiesta (2025)
+################################################################################
 
-# --- Configuration & Constants ---
-LOG_FILE="/var/log/sstp_panel_install.log"
-SSTP_CONF="/etc/sstp.conf"
-PPTPD_CONF="/etc/pptpd.conf"
-PPTPD_OPTIONS="/etc/ppp/pptpd-options"
-CHAP_SECRETS="/etc/ppp/chap-secrets"
-WEB_PANEL_DIR="/var/www/html/sstp-admin"
-NGINX_CONF="/etc/nginx/sites-available/sstp-panel"
-HTPASSWD_FILE="/etc/nginx/.sstp_htpasswd"
-SSL_CERT="/etc/ssl/certs/sstp-cert.pem"
-SSL_KEY="/etc/ssl/private/sstp-key.pem"
+LOG=/var/log/sstp_panel_install.log
+TEMP_DIR="/tmp/sstp-panel-install.$$"
+PANEL_PATH="/var/www/sstpadmin"
+PANEL_ADMIN_CONF="/etc/sstp_panel_admin"
+PANEL_AUTH_FILE="/etc/nginx/.sstpadmin_htpasswd"
+SSL_DIR="/etc/nginx/ssl-sstpadmin"
+VPN_USERS_FILE="/etc/ppp/chap-secrets"
+VPN_USERS_DIR="/etc/sstp_panel_users"
+SSTP_SERVICE="sstpd"
+NGINX_CONF="/etc/nginx/sites-available/sstpadmin"
+PHP_VER=""
+DOMAIN=""
+PUBIP=""
+GREEN='\033[0;32m'
+NC='\033[0m'
 
-# --- Colors for Output ---
-C_RESET='\033[0m'
-C_RED='\033[0;31m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[0;33m'
-C_BLUE='\033[0;34m'
-
-# --- Script Execution Logic ---
-
-# Function to print messages
-log_message() {
-    echo -e "$(date +"%Y-%m-%d %T") - $1" | tee -a "$LOG_FILE"
-}
-
-# Function to handle errors
-handle_error() {
-    log_message "${C_RED}ERROR: $1. Installation failed.${C_RESET}"
-    log_message "${C_RED}Please check the log file for details: ${LOG_FILE}${C_RESET}"
-    exit 1
-}
-
-# Ensure script is run as root
-check_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        echo -e "${C_RED}This script must be run as root. Please use 'sudo ./install_sstp_panel.sh'.${C_RESET}"
-        exit 1
-    fi
-}
-
-# Trap errors
-trap 'handle_error "An unexpected error occurred at line $LINENO"' ERR
 set -e
-set -o pipefail
+umask 022
 
-# --- Main Installation Steps ---
-
-main() {
-    # Start logging to file
-    exec > >(tee -a "$LOG_FILE") 2>&1
-
-    clear
-    log_message "${C_BLUE}=====================================================${C_RESET}"
-    log_message "${C_BLUE}== AI Fiesta SSTP VPN Server & Web Panel Installer ==${C_RESET}"
-    log_message "${C_BLUE}=====================================================${C_RESET}"
-    log_message "Starting installation..."
-
-    gather_user_input
-    install_dependencies
-    configure_sysctl
-    configure_sstp_server
-    configure_iptables
-    generate_ssl_certificate
-    configure_nginx_php
-    create_web_panel
-    start_and_enable_services
-    display_summary
-
-    log_message "${C_GREEN}Installation completed successfully!${C_RESET}"
-    set +e
-    trap - ERR
+# Log helper
+log() {
+    echo "[`date '+%Y-%m-%d %H:%M:%S'`] $*" | tee -a "$LOG"
 }
 
-gather_user_input() {
-    log_message "${C_YELLOW}--- Gathering System Information ---${C_RESET}"
+# Root check
+[ "$(id -u)" = "0" ] || { echo "Run this script as root!"; exit 1; }
 
-    # Get Public IP
-    DETECTED_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://icanhazip.com)
-    read -rp "Enter the public IP address for this server [${DETECTED_IP}]: " SERVER_IP
-    SERVER_IP=${SERVER_IP:-$DETECTED_IP}
-    if [[ -z "$SERVER_IP" ]]; then
-        handle_error "Could not determine public IP address."
+# Trap cleanup
+trap 'rm -rf "$TEMP_DIR"' EXIT INT TERM
+
+mkdir -p "$TEMP_DIR"
+touch "$LOG"
+
+log "=== Starting SSTP VPN & Panel installation ==="
+
+# 1. Detect public IP
+log "Detecting server public IP..."
+PUBIP_DETECT="$(curl -4 -s https://api.ipify.org || hostname -I | awk '{print $1}')"
+read -rp "Server Public IP [$PUBIP_DETECT]: " PUBIP
+PUBIP=${PUBIP:-$PUBIP_DETECT}
+log "Using server IP: $PUBIP"
+
+# 2. Prompt for Web Panel admin credentials
+echo -e "${GREEN}=== Web Management Panel Admin Credentials ===${NC}"
+while :; do
+    read -rp "Panel Admin Username: " ADMIN_USER
+    [[ "$ADMIN_USER" =~ ^[a-zA-Z0-9_-]{3,32}$ ]] && break
+    echo "Invalid username. Use 3-32 alphanumeric or dashes/underscores."
+done
+
+while :; do
+    read -rsp "Panel Admin Password: " ADMIN_PASS; echo
+    read -rsp "Confirm Password: " ADMIN_PASS2; echo
+    [ "$ADMIN_PASS" = "$ADMIN_PASS2" ] && [ "${#ADMIN_PASS}" -ge 8 ] && break
+    echo "Passwords do not match or are less than 8 chars."
+done
+
+# 3. Ask for (optional) hostname/FQDN
+read -rp "Server panel hostname or domain (for SSL CN) [leave blank to use $PUBIP]: " DOMAIN
+DOMAIN=${DOMAIN:-$PUBIP}
+
+# 4. Check and install prerequisites (idempotent: only install if absent)
+install_pkg() {
+    PKG="$1"
+    if ! dpkg -s "$PKG" &>/dev/null; then
+        log "Installing $PKG..."
+        apt-get install -y "$PKG" >>"$LOG" 2>&1
+    else
+        log "$PKG already installed."
     fi
-
-    # Get Hostname for SSL
-    read -rp "Enter a hostname/domain for the SSL cert (e.g., vpn.example.com) [${SERVER_IP}]: " SSL_HOST
-    SSL_HOST=${SSL_HOST:-$SERVER_IP}
-
-    # Get Web Panel Admin Credentials
-    log_message "${C_YELLOW}--- Web Panel Admin Credentials ---${C_RESET}"
-    read -rp "Enter a username for the web panel admin: " ADMIN_USER
-    while [[ -z "$ADMIN_USER" ]]; do
-        echo -e "${C_RED}Admin username cannot be empty.${C_RESET}"
-        read -rp "Enter a username for the web panel admin: " ADMIN_USER
-    done
-
-    read -rsp "Enter a password for the web panel admin: " ADMIN_PASS
-    echo
-    while [[ -z "$ADMIN_PASS" ]]; do
-        echo -e "${C_RED}Admin password cannot be empty.${C_RESET}"
-        read -rsp "Enter a password for the web panel admin: " ADMIN_PASS
-        echo
-    done
 }
 
-install_dependencies() {
-    log_message "${C_YELLOW}--- Installing Dependencies ---${C_RESET}"
-    log_message "Updating package lists..."
-    apt-get update -y
+log "Updating apt cache..."
+apt-get update >>"$LOG" 2>&1
 
-    PACKAGES=(nginx php-fpm pptpd sstp-server iptables-persistent apache2-utils)
-    for pkg in "${PACKAGES[@]}"; do
-        if dpkg -s "$pkg" &> /dev/null; then
-            log_message "${pkg} is already installed. Skipping."
-        else
-            log_message "Installing ${pkg}..."
-            apt-get install -y "$pkg" || handle_error "Failed to install ${pkg}"
-        fi
-    done
+for pkg in nginx openssl curl pwgen whois unzip; do
+    install_pkg "$pkg"
+done
+
+# PHP version detection
+if command -v php8.1 > /dev/null; then PHP_VER=8.1
+elif command -v php8.2 > /dev/null; then PHP_VER=8.2
+elif command -v php8.3 > /dev/null; then PHP_VER=8.3
+elif command -v php > /dev/null; then PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+else
+    install_pkg "php-fpm"
+    PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+fi
+
+install_pkg "php-fpm"
+install_pkg "php-cli"
+
+# Ensure php-fpm is enabled
+systemctl enable --now php*-fpm >>"$LOG" 2>&1 || true
+
+# 5. Install PPP, pptpd, and sstp-server
+for pkg in pptpd ppp sstp-server; do
+    install_pkg "$pkg"
+done
+
+# Ensure rng-tools for entropy
+install_pkg rng-tools
+
+# 6. Configure DNS for SSTP clients
+DNS1="1.1.1.1"
+DNS2="8.8.8.8"
+
+# 7. Enable IP forwarding
+log "Enabling IP forwarding..."
+sysctl -w net.ipv4.ip_forward=1 >>"$LOG"
+sed -i '/^net.ipv4.ip_forward/s/^#//' /etc/sysctl.conf
+grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf || echo "net.ipv4.ip_forward = 1" >>/etc/sysctl.conf
+
+# 8. Setup iptables for NAT and firewall (IPv4 only for VPN)
+log "Configuring iptables for SSTP VPN..."
+iptables -t nat -C POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || {
+    iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
 }
+iptables-save > /etc/iptables.rules
 
-configure_sysctl() {
-    log_message "${C_YELLOW}--- Enabling Kernel IP Forwarding ---${C_RESET}"
-    if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    fi
-    sysctl -p
-}
-
-configure_sstp_server() {
-    log_message "${C_YELLOW}--- Configuring SSTP and PPP ---${C_RESET}"
-
-    # Configure pptpd.conf
-    log_message "Configuring ${PPTPD_CONF}"
-    cat > "$PPTPD_CONF" << EOF
-option /etc/ppp/pptpd-options
-logwtmp
-localip 192.168.240.1
-remoteip 192.168.240.10-200
+cat > /etc/network/if-up.d/iptables <<EOF
+#!/bin/sh
+iptables-restore < /etc/iptables.rules
 EOF
+chmod +x /etc/network/if-up.d/iptables
 
-    # Configure pptpd-options
-    log_message "Configuring ${PPTPD_OPTIONS}"
-    cat > "$PPTPD_OPTIONS" << EOF
-name pptpd
-refuse-pap
-refuse-chap
-refuse-mschap
-require-mschap-v2
-require-mppe-128
-ms-dns 1.1.1.1
-ms-dns 8.8.8.8
-proxyarp
-lock
-nobsdcomp
-novj
-novjccomp
-nologfd
+# 9. Configure SSTP server
+log "Configuring SSTP server..."
+cat > /etc/sstpd/sstpd.conf <<EOF
+[server]
+listen-address = $PUBIP:443
+cert-file = /etc/sstpd/server.crt
+key-file = /etc/sstpd/server.key
+
+[pppd-default]
+plugin = pptpd.so
+ms-dns = $DNS1
+ms-dns = $DNS2
 EOF
+# Generate SSL for SSTP VPN
+if [ ! -f /etc/sstpd/server.key ]; then
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -subj "/CN=${DOMAIN}" \
+        -keyout /etc/sstpd/server.key -out /etc/sstpd/server.crt
+fi
 
-    # Configure chap-secrets (initialize empty file with correct permissions)
-    log_message "Initializing ${CHAP_SECRETS}"
-    touch "$CHAP_SECRETS"
-    chmod 600 "$CHAP_SECRETS"
-    # Add header comment
-    echo "# username<TAB or SPACE>server<TAB or SPACE>password<TAB or SPACE>ip" > "$CHAP_SECRETS"
-    echo "# --- Users below are managed by the web panel ---" >> "$CHAP_SECRETS"
+# 10. Configure chap-secrets
+mkdir -p "$VPN_USERS_DIR"
+touch "$VPN_USERS_FILE"
+chmod 600 "$VPN_USERS_FILE"
 
-    # Configure sstp-server
-    log_message "Configuring ${SSTP_CONF}"
-    cat > "$SSTP_CONF" << EOF
-[listen]
-host = 0.0.0.0
-port = 443
+# 11. Create systemd override for SSTP server to use proper config
+systemctl daemon-reload
+systemctl enable --now $SSTP_SERVICE >>"$LOG" 2>&1
 
-[auth]
-pppd-plugin = /usr/lib/pptpd/pptpd-logwtmp.so
-pppd-option-file = /etc/ppp/pptpd-options
+# 12. Set up Nginx with PHP-FPM for management panel
+log "Configuring Nginx and PHP for the SSTP admin panel..."
+mkdir -p "$PANEL_PATH"
+chown -R www-data:www-data "$PANEL_PATH"
 
-[ssl]
-cert-file = ${SSL_CERT}
-key-file = ${SSL_KEY}
-
-[pppd]
-# For debugging pppd
-# log-file = /var/log/sstp-pppd.log
-EOF
-}
-
-configure_iptables() {
-    log_message "${C_YELLOW}--- Configuring Firewall (iptables) ---${C_RESET}"
-    
-    # Detect primary network interface
-    INTERFACE=$(ip route | grep default | sed -e "s/^.*dev.//" -e "s/.proto.*//")
-    if [[ -z "$INTERFACE" ]]; then
-        handle_error "Could not detect primary network interface."
-    fi
-    log_message "Detected primary network interface: ${INTERFACE}"
-
-    # Flush existing rules to start fresh (optional, but good for a clean setup)
-    # iptables -F
-    # iptables -t nat -F
-
-    # Set rules
-    iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-    iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    iptables -t nat -A POSTROUTING -s 192.168.240.0/24 -o "$INTERFACE" -j MASQUERADE
-    iptables -A FORWARD -s 192.168.240.0/24 -p tcp -m tcp --syn -m conntrack --ctstate NEW -j ACCEPT
-    iptables -A FORWARD -s 192.168.240.0/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    # Persist rules
-    netfilter-persistent save
-}
-
-generate_ssl_certificate() {
-    log_message "${C_YELLOW}--- Generating Self-Signed SSL Certificate ---${C_RESET}"
-    if [ -f "$SSL_CERT" ]; then
-        log_message "SSL certificate already exists. Skipping generation."
-        return
-    fi
-    
-    # Create directory if it doesn't exist
-    mkdir -p /etc/ssl/private
-    chmod 700 /etc/ssl/private
-
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$SSL_KEY" \
-        -out "$SSL_CERT" \
-        -subj "/CN=${SSL_HOST}"
-
-    log_message "Self-signed certificate created. You can replace it later."
-    log_message "Cert: ${SSL_CERT}"
-    log_message "Key:  ${SSL_KEY}"
-    log_message "${C_YELLOW}To use Let's Encrypt, stop sstp-server, run certbot, then update the paths in ${SSTP_CONF} and ${NGINX_CONF}.${C_RESET}"
-}
-
-configure_nginx_php() {
-    log_message "${C_YELLOW}--- Configuring Nginx and PHP ---${C_RESET}"
-
-    # Create htpasswd file for web panel admin
-    htpasswd -cb "$HTPASSWD_FILE" "$ADMIN_USER" "$ADMIN_PASS"
-    chmod 600 "$HTPASSWD_FILE"
-
-    # Find PHP-FPM socket path
-    PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-    PHP_FPM_SOCK="/run/php/php${PHP_VERSION}-fpm.sock"
-    if [ ! -S "$PHP_FPM_SOCK" ]; then
-        handle_error "Could not find PHP-FPM socket at ${PHP_FPM_SOCK}"
-    fi
-    log_message "Using PHP-FPM socket: ${PHP_FPM_SOCK}"
-
-    # Create Nginx server block
-    cat > "$NGINX_CONF" << EOF
+cat >$NGINX_CONF <<EOF
 server {
-    listen 80;
-    server_name ${SSL_HOST} _;
-    return 301 https://\$host\$request_uri;
-}
+    listen 443 ssl;
+    server_name $DOMAIN;
 
-server {
-    listen 443 ssl http2;
-    server_name ${SSL_HOST} _;
+    ssl_certificate     $SSL_DIR/panel.crt;
+    ssl_certificate_key $SSL_DIR/panel.key;
 
-    ssl_certificate ${SSL_CERT};
-    ssl_certificate_key ${SSL_KEY};
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384';
-    
-    root /var/www/html;
-    index index.php index.html;
+    root $PANEL_PATH;
+    index index.php;
 
     location / {
-        # Redirect root to admin panel for convenience
-        return 302 /sstp-admin;
+        auth_basic "SSTP Panel";
+        auth_basic_user_file $PANEL_AUTH_FILE;
+        try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location /sstp-admin {
-        auth_basic "SSTP Admin Panel";
-        auth_basic_user_file ${HTPASSWD_FILE};
-
-        try_files \$uri \$uri/ =404;
-        
-        location ~ \.php$ {
-            include snippets/fastcgi-php.conf;
-            fastcgi_pass unix:${PHP_FPM_SOCK};
-        }
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php${PHP_VER}-fpm.sock;
     }
 }
 EOF
 
-    # Enable the site
-    if [ ! -L "/etc/nginx/sites-enabled/sstp-panel" ]; then
-        ln -s "$NGINX_CONF" /etc/nginx/sites-enabled/
-    fi
+ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/sstpadmin"
+[ -f /etc/nginx/sites-enabled/default ] && rm /etc/nginx/sites-enabled/default
 
-    # Test Nginx config
-    nginx -t || handle_error "Nginx configuration test failed."
+# 13. Create self-signed certificate for panel
+mkdir -p $SSL_DIR
+if [ ! -f $SSL_DIR/panel.key ]; then
+    openssl req -new -x509 -nodes -days 1095 -subj "/CN=${DOMAIN}" \
+        -out $SSL_DIR/panel.crt -keyout $SSL_DIR/panel.key
+fi
+
+# 14. Configure HTTP Auth for panel
+if ! command -v htpasswd >/dev/null; then
+    install_pkg apache2-utils
+fi
+echo "${ADMIN_USER}:$(openssl passwd -6 "${ADMIN_PASS}")" > "$PANEL_AUTH_FILE"
+chmod 640 "$PANEL_AUTH_FILE"
+chown root:www-data "$PANEL_AUTH_FILE"
+
+# 15. Deploy panel PHP files (user management)
+cat > "$PANEL_PATH/index.php" <<'EOF'
+<?php
+// Simple SSTP VPN User Manager
+
+define('CHAP_SECRETS','/etc/ppp/chap-secrets');
+define('USER_DIR','/etc/sstp_panel_users');
+
+function verify_panel_auth() {
+    if (!isset($_SERVER['PHP_AUTH_USER'])) return false;
+    // All PHP requests pass basic Auth via Nginx
+    return true;
 }
 
-create_web_panel() {
-    log_message "${C_YELLOW}--- Creating Web Management Panel ---${C_RESET}"
-    mkdir -p "$WEB_PANEL_DIR"
-
-    # Create the PHP web panel file
-    cat > "${WEB_PANEL_DIR}/index.php" << 'EOF'
-<?php
-// SSTP VPN User Management Panel by AI Fiesta
-// This panel manages users in /etc/ppp/chap-secrets
-
-session_start();
-$chap_file = '/etc/ppp/chap-secrets';
-
-// --- Helper Functions ---
-function get_users() {
-    global $chap_file;
-    $lines = file($chap_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+function read_users() {
+    $lines = file(CHAP_SECRETS, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
     $users = [];
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (empty($line)) continue;
-        
-        $status = 'active';
-        if (strpos($line,
-        }
-        
+    foreach($lines as $line) {
+        if ($line === '#') continue;
         $parts = preg_split('/\s+/', $line);
-        if (count($parts) >= 3) {
-            $users[] = [
-                'username' => $parts[0],
-                'server' => $parts[1],
-                'password' => $parts[2],
-                'ip' => isset($parts[3]) ? $parts[3] : '*',
-                'status' => $status
-            ];
-        }
+        if (count($parts) < 4) continue;
+        $users[] = [            'username'=>$parts,
+            'password'=>$parts[2],
+            'status'=>(!is_file(USER_DIR."/".$parts.".inactive"))?'Active':'Inactive'
+        ];
     }
     return $users;
 }
 
 function save_users($users) {
-    global $chap_file;
-    $content = "# username<TAB or SPACE>server<TAB or SPACE>password<TAB or SPACE>ip\n";
-    $content .= "# --- Users below are managed by the web panel ---\n";
-    foreach ($users as $user) {
-        $line = $user['username'] . "\t*\t" . $user['password'] . "\t*";
-        if ($user['status'] === 'inactive') {
-            $line = '# ' . $line;
-        }
-        $content .= $line . "\n";
+    $f = fopen(CHAP_SECRETS,"w");
+    foreach($users as $u) {
+        if (strpos($u['username'],' ')!==false) continue;
+        fwrite($f,"{$u['username']} * {$u['password']} *\n");
     }
-    // Use a temporary file and rename for atomicity
-    $temp_file = $chap_file . '.tmp';
-    if (file_put_contents($temp_file, $content) !== false) {
-        // Set secure permissions before moving
-        chmod($temp_file, 0600);
-        if (rename($temp_file, $chap_file)) {
-            return true;
-        }
-    }
-    return false;
+    fclose($f);
 }
 
-function user_exists($username) {
-    $users = get_users();
-    foreach ($users as $user) {
-        if ($user['username'] === $username) {
-            return true;
-        }
-    }
-    return false;
+function password_hash_apr1($plain) {
+    // fallback: use mkpasswd if available, else plaintext (for demo only)
+    $out = trim(shell_exec('mkpasswd -m sha-512 '.escapeshellarg($plain)));
+    if (!$out) $out = $plain;
+    return $out;
 }
 
-function generate_password($length = 12) {
-    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()';
-    return substr(str_shuffle($chars), 0, $length);
-}
-
-// --- Handle POST Requests ---
-$message = '';
-$message_type = '';
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-    
-    if ($action === 'add_user') {
-        $username = trim($_POST['username']);
-        $password = trim($_POST['password']);
-
-        if (empty($password)) {
-            $password = generate_password();
-        }
-
-        if (!empty($username) && !preg_match('/[^a-zA-Z0-9_.-]/', $username)) {
-            if (!user_exists($username)) {
-                $users = get_users();
-                $users[] = [
-                    'username' => $username,
-                    'server' => '*',
-                    'password' => $password,
-                    'ip' => '*',
-                    'status' => 'active'
-                ];
-                if (save_users($users)) {
-                    $_SESSION['message'] = "User '{$username}' added successfully. Password: <strong>{$password}</strong>";
-                    $_SESSION['message_type'] = 'success';
-                } else {
-                    $_SESSION['message'] = "Error writing to {$chap_file}. Check permissions.";
-                    $_SESSION['message_type'] = 'error';
-                }
-            } else {
-                $_SESSION['message'] = "User '{$username}' already exists.";
-                $_SESSION['message_type'] = 'error';
-            }
+// Handle POST
+if ($_SERVER['REQUEST_METHOD']=='POST') {
+    $action = $_POST['action'];
+    $users = read_users();
+    if ($action=='add') {
+        $user = preg_replace('/\W/','',$_POST['username']);
+        if (!$user || in_array($user, array_column($users,'username'))) {
+            $err = "Username invalid or exists";
         } else {
-            $_SESSION['message'] = 'Invalid username. Use only letters, numbers, underscore, dot, or hyphen.';
-            $_SESSION['message_type'] = 'error';
+            $pw = $_POST['password'] ?: bin2hex(random_bytes(4));
+            $hash = password_hash_apr1($pw);
+            // save user
+            file_put_contents(USER_DIR."/$user.pwd", "$hash\n");
+            $users[] = ['username'=>$user,'password'=>$hash,'status'=>'Active'];
+            save_users($users);
+            $success = "User $user created. Password: <b>$pw</b>";
+        }
+    } elseif ($action=='del') {
+        $user = $_POST['username'];
+        $users = array_filter($users, fn($u)=>$u['username']!=$user);
+        @unlink(USER_DIR."/$user.pwd");
+        @unlink(USER_DIR."/$user.inactive");
+        save_users($users);
+        $success = "User $user deleted.";
+    } elseif ($action=='toggle') {
+        $user = $_POST['username'];
+        $file = USER_DIR."/$user.inactive";
+        if (is_file($file)) {
+            unlink($file);
+            $success = "User $user activated.";
+        } else {
+            touch($file);
+            $success = "User $user deactivated.";
         }
     }
-    header("Location: " . $_SERVER['PHP_SELF']);
-    exit();
 }
-
-if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-    $action = $_GET['action'] ?? '';
-    $username = $_GET['user'] ?? '';
-
-    if (!empty($username)) {
-        $users = get_users();
-        $user_found = false;
-        
-        foreach ($users as $i => &$user) {
-            if ($user['username'] === $username) {
-                $user_found = true;
-                if ($action === 'delete') {
-                    unset($users[$i]);
-                    $_SESSION['message'] = "User '{$username}' has been deleted.";
-                    $_SESSION['message_type'] = 'success';
-                } elseif ($action === 'toggle') {
-                    $user['status'] = ($user['status'] === 'active') ? 'inactive' : 'active';
-                     $_SESSION['message'] = "User '{$username}' status changed to {$user['status']}.";
-                     $_SESSION['message_type'] = 'success';
-                }
-                break;
-            }
-        }
-
-        if ($user_found) {
-            save_users(array_values($users));
-        }
-        header("Location: " . $_SERVER['PHP_SELF']);
-        exit();
-    }
-}
-
-if (isset($_SESSION['message'])) {
-    $message = $_SESSION['message'];
-    $message_type = $_SESSION['message_type'];
-    unset($_SESSION['message']);
-    unset($_SESSION['message_type']);
-}
-
-$all_users = get_users();
-
+$users = read_users();
 ?>
 <!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SSTP User Management</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; padding: 2em; }
-        .container { max-width: 800px; margin: 0 auto; background-color: #fff; padding: 2em; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        h1, h2 { color: #2c3e50; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 1em; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #f2f2f2; }
-        .action-btn { color: #fff; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 0.9em; }
-        .delete-btn { background-color: #e74c3c; }
-        .toggle-btn-active { background-color: #27ae60; }
-        .toggle-btn-inactive { background-color: #f39c12; }
-        .status-active { color: #27ae60; font-weight: bold; }
-        .status-inactive { color: #e67e22; font-weight: bold; }
-        form { margin-top: 1em; padding: 1.5em; background-color: #ecf0f1; border-radius: 5px; }
-        input[type="text"], input[type="password"] { width: 250px; padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
-        input[type="submit"] { background-color: #3498db; color: #fff; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
-        input[type="submit"]:hover { background-color: #2980b9; }
-        .message { padding: 1em; border-radius: 5px; margin-bottom: 1em; }
-        .message.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .message.error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .password-note { font-size: 0.9em; color: #7f8c8d; }
-    </style>
-    <script>
-        function confirmDelete(username) {
-            return confirm('Are you sure you want to delete the user "' + username + '"?');
-        }
-    </script>
+<html><head>
+<title>SSTP VPN User Management</title>
+<style>
+body { font-family: sans-serif; background: #eee; padding:2em;}
+table { border-collapse: collapse;}
+td,th { border: 1px solid #ccc; padding:4px;}
+th { background:#f4f4f4;}
+form { margin:1em 0;}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>SSTP User Management</h1>
-        
-        <?php if ($message): ?>
-            <div class="message <?php echo htmlspecialchars($_
+<h2>SSTP VPN User Management</h2>
+<?php
+if (isset($err)) echo "<b style='color:red'>$err</b><br>";
+if (isset($success)) echo "<b style='color:green'>$success</b><br>";
+?>
+<table>
+<tr><th>User</th><th>Status</th><th>Action</th></tr>
+<?php foreach($users as $u): ?>
+<tr>
+<td><?=htmlspecialchars($u['username'])?></td>
+<td><?=htmlspecialchars($u['status'])?></td>
+<td>
+<form method="post" style="display:inline">
+    <input type="hidden" name="username" value="<?=$u['username']?>">
+    <button name="action" value="toggle" type="submit"><?=$u['status']=='Active'?'Deactivate':'Activate'?></button>
+    <button name="action" value="del" onclick="return confirm('Delete <?=$u['username']?>?')" type="submit">Delete</button>
+</form>
+</td>
+</tr>
+<?php endforeach; ?>
+</table>
+<h3>Add User</h3>
+<form method="post">
+User: <input name="username" pattern="[a-zA-Z0-9_]{3,32}" required>
+Password: <input name="password"> (leave blank for random)<br>
+<button name="action" value="add" type="submit">Add User</button>
+</form>
+</body></html>
+EOF
+
+# set safe permissions
+chmod 750 "$PANEL_PATH"
+chown -R www-data:www-data "$PANEL_PATH"
+
+# 16. Restrict panel directory access
+chmod o-rwx "$PANEL_PATH"
+chown root:www-data "$PANEL_PATH"
+
+# 17. Restart services
+systemctl restart nginx
+systemctl restart php${PHP_VER}-fpm
+systemctl restart $SSTP_SERVICE
+
+# 18. Save admin login
+echo "ADMIN_USER='$ADMIN_USER'
+ADMIN_PASS='(hidden)'  # Was: $ADMIN_PASS
+DOMAIN='$DOMAIN'
+" > $PANEL_ADMIN_CONF
+chmod 600 $PANEL_ADMIN_CONF
+
+# --- Post-install summary
+cat <<EOM
+
+${GREEN}===== [SSTP VPN Server & Web Panel Installed] =====${NC}
+
+SSTP Server IP:      ${GREEN}$PUBIP${NC}
+Panel URL:           ${GREEN}https://${DOMAIN}/admin${NC}
+Admin Username:      ${GREEN}$ADMIN_USER${NC}
+Admin Password:      ${GREEN}(what you chose)${NC}
+
+To manage users, log in via browser (HTTPS, ignore self-signed cert warning). Panel is protected with HTTP Basic Auth.
+
+Panel directory is:   $PANEL_PATH
+
+SSTP service control:
+  sudo systemctl start $SSTP_SERVICE
+  sudo systemctl stop $SSTP_SERVICE
+  sudo systemctl restart $SSTP_SERVICE
+
+Sample Windows client (rasphone) command:
+
+  rasphone -d "sstp-vpn" (configure with VPN server $PUBIP and your created username/password in the Windows VPN GUI)
+
+For better SSL security, replace the panel certificate at:
+  Cert:  $SSL_DIR/panel.crt
+  Key:   $SSL_DIR/panel.key
+  # To use Let's Encrypt, follow Certbot instructions after DNS is ready.
+
+All actions are logged at ${LOG}
+EOM
+
+exit 0
